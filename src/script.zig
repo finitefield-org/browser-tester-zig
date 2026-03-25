@@ -165,6 +165,13 @@ pub const ScriptEvent = struct {
 pub const ScriptFunction = struct {
     params: []const []const u8 = &.{},
     body_source: []const u8 = "",
+    captured_bindings: []const Binding = &.{},
+    is_arrow: bool = false,
+};
+
+const ParsedFunction = struct {
+    name: ?[]const u8 = null,
+    function: ScriptFunction,
 };
 
 pub const ScriptListenerRecord = struct {
@@ -2002,6 +2009,15 @@ const Parser = struct {
 
     fn parseStatement(self: *Parser) errors.Result(Statement) {
         self.skipWhitespaceAndComments();
+        if (try self.tryParseFunctionLike()) |function| {
+            const name = function.name orelse return error.ScriptParse;
+            return .{
+                .const_declaration = .{
+                    .name = name,
+                    .value = try self.makeExpr(.{ .arrow_function = function.function }),
+                },
+            };
+        }
         if (self.consumeKeyword("const")) {
             self.skipWhitespaceAndComments();
             const name = try self.parseIdentifier();
@@ -2130,8 +2146,14 @@ const Parser = struct {
     }
 
     fn parseIdentifierOrNewExpr(self: *Parser) errors.Result(*Expr) {
+        const start = self.pos;
         const ident = try self.parseIdentifier();
         if (!std.mem.eql(u8, ident, "new")) {
+            if (std.mem.eql(u8, ident, "function")) {
+                self.pos = start;
+                const function = try self.tryParseFunctionLike() orelse return error.ScriptParse;
+                return self.makeExpr(.{ .arrow_function = function.function });
+            }
             return self.makeExpr(.{ .identifier = ident });
         }
 
@@ -2148,6 +2170,72 @@ const Parser = struct {
     }
 
     fn tryParseArrowFunction(self: *Parser) errors.Result(?ScriptFunction) {
+        const start = self.pos;
+        if (self.peekChar() != '(') return null;
+
+        const params = try self.tryParseFunctionParams() orelse {
+            self.pos = start;
+            return null;
+        };
+
+        self.skipWhitespaceAndComments();
+        if (!self.consumeStr("=>")) {
+            self.pos = start;
+            return null;
+        }
+
+        self.skipWhitespaceAndComments();
+        if (self.peekChar() != '{') {
+            self.pos = start;
+            return null;
+        }
+
+        const body_source = try self.captureBracedBlock();
+        return ScriptFunction{
+            .params = params,
+            .body_source = body_source,
+            .is_arrow = true,
+        };
+    }
+
+    fn tryParseFunctionLike(self: *Parser) errors.Result(?ParsedFunction) {
+        const start = self.pos;
+        if (!self.consumeKeyword("function")) return null;
+
+        self.skipWhitespaceAndComments();
+        var name: ?[]const u8 = null;
+        if (self.peekChar()) |ch| {
+            if (isIdentifierStartByte(ch)) {
+                name = self.parseIdentifier() catch {
+                    self.pos = start;
+                    return error.ScriptParse;
+                };
+                self.skipWhitespaceAndComments();
+            }
+        }
+
+        const params = try self.tryParseFunctionParams() orelse {
+            self.pos = start;
+            return error.ScriptParse;
+        };
+
+        self.skipWhitespaceAndComments();
+        if (self.peekChar() != '{') {
+            self.pos = start;
+            return error.ScriptParse;
+        }
+
+        const body_source = try self.captureBracedBlock();
+        return .{
+            .name = name,
+            .function = .{
+                .params = params,
+                .body_source = body_source,
+            },
+        };
+    }
+
+    fn tryParseFunctionParams(self: *Parser) errors.Result(?[]const []const u8) {
         const start = self.pos;
         if (self.peekChar() != '(') return null;
 
@@ -2179,23 +2267,7 @@ const Parser = struct {
             return null;
         }
 
-        self.skipWhitespaceAndComments();
-        if (!self.consumeStr("=>")) {
-            self.pos = start;
-            return null;
-        }
-
-        self.skipWhitespaceAndComments();
-        if (self.peekChar() != '{') {
-            self.pos = start;
-            return null;
-        }
-
-        const body_source = try self.captureBracedBlock();
-        return ScriptFunction{
-            .params = try self.allocator.dupe([]const u8, params.items),
-            .body_source = body_source,
-        };
+        return try self.allocator.dupe([]const u8, params.items);
     }
 
     fn captureBracedBlock(self: *Parser) errors.Result([]const u8) {
@@ -5939,8 +6011,18 @@ fn evalExpr(
         .call => |call| evalCall(allocator, host, bindings, call),
         .new_expression => |new_expr| evalNewExpr(allocator, host, bindings, new_expr),
         .binary_add => |binary| evalBinaryAdd(allocator, host, bindings, binary),
-        .arrow_function => |function| .{ .function = function },
+        .arrow_function => |function| .{ .function = try captureFunctionValue(allocator, function, bindings) },
     };
+}
+
+fn captureFunctionValue(
+    allocator: std.mem.Allocator,
+    function: ScriptFunction,
+    bindings: []const Binding,
+) errors.Result(ScriptFunction) {
+    var captured = function;
+    captured.captured_bindings = try allocator.dupe(Binding, bindings);
+    return captured;
 }
 
 fn evalNewExpr(
@@ -19698,6 +19780,10 @@ pub fn functionBindings(
     var bindings_out: std.ArrayList(Binding) = .empty;
     errdefer bindings_out.deinit(allocator);
 
+    for (function.captured_bindings) |binding| {
+        try bindings_out.append(allocator, binding);
+    }
+
     for (function.params, 0..) |param, index| {
         try bindings_out.append(allocator, .{
             .name = param,
@@ -19718,6 +19804,17 @@ fn eventListenerBindings(
 ) errors.Result(std.ArrayList(Binding)) {
     var bindings_out: std.ArrayList(Binding) = .empty;
     errdefer bindings_out.deinit(allocator);
+
+    for (function.captured_bindings) |binding| {
+        try bindings_out.append(allocator, binding);
+    }
+
+    if (!function.is_arrow) {
+        try bindings_out.append(allocator, .{
+            .name = "this",
+            .value = valueForListenerTarget(event.current_target orelse event.target),
+        });
+    }
 
     try bindings_out.append(allocator, .{
         .name = "event",

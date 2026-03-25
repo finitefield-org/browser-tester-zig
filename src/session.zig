@@ -2160,6 +2160,22 @@ pub const Session = struct {
         _ = self;
         var bindings: std.ArrayList(script.Binding) = .empty;
         errdefer bindings.deinit(allocator);
+
+        for (handler.captured_bindings) |binding| {
+            try bindings.append(allocator, binding);
+        }
+
+        if (!handler.is_arrow) {
+            try bindings.append(allocator, .{
+                .name = "this",
+                .value = switch (event.current_target orelse event.target) {
+                    .document => .{ .document = {} },
+                    .window => .{ .window = {} },
+                    .element => |element| .{ .element = element },
+                },
+            });
+        }
+
         try bindings.append(allocator, .{
             .name = "event",
             .value = .{ .event = event },
@@ -4124,17 +4140,33 @@ fn duplicateScriptFunction(
         params[index] = try allocator.dupe(u8, param);
     }
 
+    const captured_bindings = try allocator.alloc(script.Binding, handler.captured_bindings.len);
+    for (handler.captured_bindings, 0..) |binding, index| {
+        captured_bindings[index] = .{
+            .name = try allocator.dupe(u8, binding.name),
+            .value = binding.value,
+        };
+    }
+
     return .{
         .params = params,
         .body_source = try allocator.dupe(u8, handler.body_source),
+        .captured_bindings = captured_bindings,
+        .is_arrow = handler.is_arrow,
     };
 }
 
 fn scriptFunctionEquals(lhs: script.ScriptFunction, rhs: script.ScriptFunction) bool {
     if (!std.mem.eql(u8, lhs.body_source, rhs.body_source)) return false;
+    if (lhs.is_arrow != rhs.is_arrow) return false;
     if (lhs.params.len != rhs.params.len) return false;
     for (lhs.params, rhs.params) |lhs_param, rhs_param| {
         if (!std.mem.eql(u8, lhs_param, rhs_param)) return false;
+    }
+    if (lhs.captured_bindings.len != rhs.captured_bindings.len) return false;
+    for (lhs.captured_bindings, rhs.captured_bindings) |lhs_binding, rhs_binding| {
+        if (!std.mem.eql(u8, lhs_binding.name, rhs_binding.name)) return false;
+        if (!std.meta.eql(lhs_binding.value, rhs_binding.value)) return false;
     }
     return true;
 }
